@@ -1,0 +1,42 @@
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python virtual environments
+.venv/
+**/.venv/
+venv/
+**/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend dependencies and builds
+node_modules/
+dist/
+
+# Local uploads and storage
+backend/storage/
+
+# Logs and IDE files
+*.log
+.vscode/
+.idea/
+
+# Local databases and backups
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql
+*.bak
+
+# Private keys and credentials
+*.pem
+*.key
+id_rsa
+credentials.json

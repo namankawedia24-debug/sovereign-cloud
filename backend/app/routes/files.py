@@ -1,3 +1,9 @@
+from app.encryption import encrypt_data, decrypt_data
+from app.audit import log_event
+
+from app.azure_storage import get_container_client
+import uuid
+
 from fastapi import APIRouter, Depends, UploadFile, File as FastAPIFile, HTTPException
 from sqlalchemy.orm import Session
 from pathlib import Path
@@ -16,6 +22,10 @@ from app.policy_checks import check_file_policy
 
 from fastapi.responses import FileResponse, Response
 from urllib.parse import quote
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/files", tags=["Files"])
 
@@ -58,44 +68,55 @@ def upload_file(
             detail="Filename is required"
         )
 
-    # 2. Create user's storage directory
-    user_storage_dir = STORAGE_DIR / str(current_user.id)
-    user_storage_dir.mkdir(parents=True, exist_ok=True)
-
-    # 3. Prevent unsafe filenames
+    
+    # 2. Prevent unsafe filenames
     safe_filename = Path(uploaded_file.filename).name
 
-    file_path = user_storage_dir / safe_filename
+    # 3. Generate a unique Azure blob name
+    blob_name = f"{current_user.id}/{uuid.uuid4().hex}_{safe_filename}"
 
-    # 4. Save the uploaded file
-    # Read the uploaded content
+
+    
+    # 4. Read and validate the uploaded content
     file_data = uploaded_file.file.read()
-
-    # Calculate the hash of the original file content
-    file_hash = hashlib.sha256(file_data).hexdigest()
-
     original_size = len(file_data)
 
-    if policy["encryption_required"]:
-        file_data = encrypt_data(file_data)
-
-    with file_path.open("wb") as buffer:
-        buffer.write(file_data)
-
-    file_size = original_size
-
-    if file_size > MAX_FILE_SIZE:
-        file_path.unlink()
+    if original_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
             detail="File size exceeds 10 MB limit"
         )
 
+    # 5. Calculate the hash of the original file
+    file_hash = hashlib.sha256(file_data).hexdigest()
+
+    # 6. Encrypt when required by policy
+    if policy["encryption_required"]:
+        file_data = encrypt_data(file_data)
+
+    # 7. Upload to Azure Blob Storage
+    container_client = get_container_client()
+    blob_client = container_client.get_blob_client(blob_name)
+
+    try:
+        blob_client.upload_blob(file_data, overwrite=False)
+
+    except Exception as e:
+        logger.exception("Azure Blob Storage upload failed")
+
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to upload file to Azure Blob Storage"
+        )
+
+    file_size = original_size
+
+
     # 6. Store metadata in database
     new_file = File(
         owner_id=current_user.id,
         filename=safe_filename,
-        storage_path=str(file_path),
+        storage_path=blob_name,
         size=file_size,
         content_type=uploaded_file.content_type,
         classification=classification,
@@ -191,19 +212,19 @@ def download_file(
             detail="You do not have permission to access this file"
         )
 
-    # 3. Check that the actual file exists
-    file_path = Path(file.storage_path)
+    
+    # 3. Retrieve the file from Azure Blob Storage
+    container_client = get_container_client()
+    blob_client = container_client.get_blob_client(file.storage_path)
 
-    if not file_path.exists():
+    try:
+        stored_data = blob_client.download_blob().readall()
+    except Exception:
         raise HTTPException(
             status_code=404,
-            detail="Physical file not found"
+            detail="File not found in Azure Blob Storage"
         )
 
-
-
-    # 4. Read the stored file
-    stored_data = file_path.read_bytes()
 
     # 5. Decrypt if required
     if file.classification in {"CONFIDENTIAL", "RESTRICTED"}:
@@ -305,11 +326,19 @@ def delete_file(
         )
 
 
-    # 3. Delete the physical file
-    file_path = Path(file.storage_path)
+        
+    # 3. Delete the file from Azure Blob Storage
+    container_client = get_container_client()
+    blob_client = container_client.get_blob_client(file.storage_path)
 
-    if file_path.exists():
-        file_path.unlink()
+    try:
+        blob_client.delete_blob()
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to delete file from Azure Blob Storage"
+        )
+
 
     # 4. Delete metadata from PostgreSQL
     db.delete(file)

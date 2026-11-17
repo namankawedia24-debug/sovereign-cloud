@@ -1,0 +1,43 @@
+
+services:
+  db:
+    image: postgres:16
+    container_name: sovereign-cloud-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sovereign_user
+      POSTGRES_PASSWORD: sovereign_password
+      POSTGRES_DB: sovereign_cloud
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sovereign_user -d sovereign_cloud"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: namankawedia/sovereign-cloud-backend:1.0
+    container_name: sovereign-cloud-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://sovereign_user:sovereign_password@db:5432/sovereign_cloud
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    image: namankawedia/sovereign-cloud-frontend:1.0
+    container_name: sovereign-cloud-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

@@ -4,6 +4,9 @@ from app.audit import log_event
 from app.azure_storage import get_container_client
 import uuid
 
+from pydantic import BaseModel, EmailStr
+from app.models import FilePermission
+
 from fastapi import APIRouter, Depends, UploadFile, File as FastAPIFile, HTTPException
 from sqlalchemy.orm import Session
 from pathlib import Path
@@ -174,6 +177,45 @@ def list_files(
         }
         for file in files
     ]
+    
+
+@router.get("/shared-with-me")
+def shared_with_me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    shared_files = (
+        db.query(File, User)
+        .join(
+            FilePermission,
+            File.id == FilePermission.file_id
+        )
+        .join(
+            User,
+            File.owner_id == User.id
+        )
+        .filter(
+            FilePermission.user_id == current_user.id,
+            FilePermission.permission == "READ",
+            File.classification != "RESTRICTED"
+        )
+        .all()
+    )
+
+    return [
+        {
+            "id": file.id,
+            "filename": file.filename,
+            "classification": file.classification,
+            "size": file.size,
+            "storage_region": file.storage_region,
+            "shared_by": owner.name,
+            "shared_by_email": owner.email,
+            "shared_at": None
+        }
+        for file, owner in shared_files
+    ]
+
 
 @router.get("/{file_id}/download")
 def download_file(
@@ -196,7 +238,28 @@ def download_file(
 
     # 2. Check file ownership
 
-    if file.owner_id != current_user.id:
+    
+    # 2. Check owner or shared-user permission
+
+    is_owner = file.owner_id == current_user.id
+
+    shared_permission = (
+        db.query(FilePermission)
+        .filter(
+            FilePermission.file_id == file.id,
+            FilePermission.user_id == current_user.id,
+            FilePermission.permission == "READ"
+        )
+        .first()
+    )
+
+    # Restricted files are owner-only
+    is_authorized = is_owner or (
+        file.classification != "RESTRICTED"
+        and shared_permission is not None
+    )
+
+    if not is_authorized:
         log_event(
             db=db,
             action="FILE_ACCESS_DENIED",
@@ -204,13 +267,14 @@ def download_file(
             status="FAILURE",
             user_id=current_user.id,
             resource_id=file.id,
-            details="User attempted to download another user's file",
+            details="Unauthorized file download attempt",
         )
 
         raise HTTPException(
             status_code=403,
             detail="You do not have permission to access this file"
         )
+
 
     
     # 3. Retrieve the file from Azure Blob Storage
@@ -360,54 +424,153 @@ def delete_file(
         "file_id": file_id
     }
 
+class ShareFileRequest(BaseModel):
+    email: EmailStr
+
+@router.post("/{file_id}/share")
 
 @router.post("/{file_id}/share")
 def share_file(
     file_id: int,
+    request: ShareFileRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # 1. Find the file
-    file = (
-        db.query(File)
-        .filter(File.id == file_id)
-        .first()
+    # Find the file
+    file = db.query(File).filter(File.id == file_id).first()
+
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Only the owner can share
+    if file.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the file owner can share this file"
+        )
+
+    # Check classification policy
+    policy = get_policy(file.classification)
+
+    if policy["external_sharing"] == "DISABLED":
+        raise HTTPException(
+            status_code=403,
+            detail="Restricted files cannot be shared"
+        )
+
+    # Find registered recipient
+    recipient = db.query(User).filter(
+        User.email == str(request.email)
+    ).first()
+
+    if not recipient:
+        raise HTTPException(
+            status_code=404,
+            detail="Recipient must have a registered account"
+        )
+
+    if recipient.id == current_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You already own this file"
+        )
+
+    # Avoid duplicate permissions
+    existing = db.query(FilePermission).filter(
+        FilePermission.file_id == file.id,
+        FilePermission.user_id == recipient.id
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="File is already shared with this user"
+        )
+
+    # Grant read permission
+    permission = FilePermission(
+        file_id=file.id,
+        user_id=recipient.id,
+        permission="READ"
     )
 
-    if file is None:
+    db.add(permission)
+    db.commit()
+
+    log_event(
+        db=db,
+        action="FILE_SHARED",
+        resource_type="FILE",
+        status="SUCCESS",
+        user_id=current_user.id,
+        resource_id=file.id,
+        details=f"Read access granted to user ID {recipient.id}"
+    )
+
+    return {
+        "message": "File shared successfully",
+        "file_id": file.id,
+        "shared_with": recipient.email,
+        "permission": "READ"
+    }
+
+
+@router.delete("/{file_id}/share/{user_id}")
+def revoke_file_access(
+    file_id: int,
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Find the file
+    file = db.query(File).filter(
+        File.id == file_id
+    ).first()
+
+    if not file:
         raise HTTPException(
             status_code=404,
             detail="File not found"
         )
 
-    # 2. Check ownership
+    # Only the owner can revoke access
     if file.owner_id != current_user.id:
         raise HTTPException(
             status_code=403,
-            detail="You do not have permission to share this file"
+            detail="Only the file owner can revoke access"
         )
 
-    # 3. Retrieve the policy
-    policy = get_policy(file.classification)
-    sharing_rule = policy["external_sharing"]
+    # Find the sharing permission
+    permission = db.query(FilePermission).filter(
+        FilePermission.file_id == file_id,
+        FilePermission.user_id == user_id
+    ).first()
 
-    # 4. Enforce the sharing policy
-    if sharing_rule == "DISABLED":
+    if not permission:
         raise HTTPException(
-            status_code=403,
-            detail="Sharing is disabled for RESTRICTED files"
+            status_code=404,
+            detail="No sharing permission found for this user"
         )
 
-    if sharing_rule == "RESTRICTED":
-        raise HTTPException(
-            status_code=403,
-            detail="Additional authorization is required to share this file"
-        )
+    # Remove the permission
+    db.delete(permission)
+    db.commit()
+
+    # Record the action
+    log_event(
+        db=db,
+        action="FILE_ACCESS_REVOKED",
+        resource_type="FILE",
+        status="SUCCESS",
+        user_id=current_user.id,
+        resource_id=file_id,
+        details=f"Access revoked for user ID {user_id}"
+    )
 
     return {
-        "message": "Sharing permitted by policy",
-        "file_id": file.id,
-        "classification": file.classification
+        "message": "File access revoked successfully",
+        "file_id": file_id,
+        "revoked_user_id": user_id
     }
 
 

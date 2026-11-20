@@ -73,3 +73,32 @@ class AuditLog(Base):
         server_default=func.now(),
         nullable=False
     )
+
+
+class FilePermission(Base):
+    __tablename__ = "file_permissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    file_id = Column(
+        Integer,
+        ForeignKey("files.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    permission = Column(
+        String(20),
+        nullable=False,
+        default="READ"
+    )
+
+    granted_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )

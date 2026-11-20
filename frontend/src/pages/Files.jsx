@@ -11,6 +11,13 @@ function Files({ theme = 'dark' }) {
   const [dragging, setDragging] = useState(false)
   const [message, setMessage] = useState('')
   const [policyResults, setPolicyResults] = useState({})
+  const [sharingFileId, setSharingFileId] = useState(null)
+  const [recipientEmail, setRecipientEmail] = useState('')
+  const [sharing, setSharing] = useState(false)
+  const [sharedFiles, setSharedFiles] = useState([])
+  const [revokingFileId, setRevokingFileId] = useState(null)
+  const [revokeEmail, setRevokeEmail] = useState('')
+  const [revoking, setRevoking] = useState(false)
 
   const fileInputRef = useRef(null)
   const isDark = theme === 'dark'
@@ -25,8 +32,22 @@ function Files({ theme = 'dark' }) {
     }
   }
 
+
+  async function loadSharedFiles() {
+    try {
+      const response = await authenticatedFetch('/files/shared-with-me')
+      const data = await response.json()
+
+      setSharedFiles(data)
+    } catch (error) {
+      setMessage(`Unable to load shared files: ${error.message}`)
+    }
+  }
+
+
   useEffect(() => {
     loadFiles()
+    loadSharedFiles()
   }, [])
 
   function handleFileSelection(file) {
@@ -125,6 +146,100 @@ function Files({ theme = 'dark' }) {
       URL.revokeObjectURL(url)
     } catch (error) {
       setMessage(`Download failed: ${error.message}`)
+    }
+  }
+
+
+  async function handleRevoke(event) {
+    event.preventDefault()
+
+    if (revokingFileId === null || !revokeEmail.trim()) {
+      setMessage('Please enter a recipient email.')
+      return
+    }
+
+    setRevoking(true)
+    setMessage('')
+
+    try {
+      const response = await authenticatedFetch(
+        `/files/${revokingFileId}/share`,
+        {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email: revokeEmail.trim(),
+          }),
+        }
+      )
+
+      const responseText = await response.text()
+      const result = responseText ? JSON.parse(responseText) : {}
+
+      setMessage(result.message || 'File access revoked successfully.')
+      setRevokingFileId(null)
+      setRevokeEmail('')
+    } catch (error) {
+      setMessage(`Revoke failed: ${error.message}`)
+    } finally {
+      setRevoking(false)
+    }
+  }
+
+
+  async function handleShare(event) {
+    event.preventDefault()
+
+    if (!sharingFileId || !recipientEmail.trim()) {
+      setMessage('Please enter a recipient email.')
+      return
+    }
+
+    setSharing(true)
+    setMessage('')
+
+    try {
+      const response = await authenticatedFetch(
+        `/files/${sharingFileId}/share`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email: recipientEmail.trim(),
+          }),
+        }
+      )
+
+
+      const responseText = await response.text()
+
+      let result = {}
+
+      if (responseText.trim()) {
+        try {
+          result = JSON.parse(responseText)
+        } catch {
+          throw new Error(
+            `Server returned invalid JSON (HTTP ${response.status})`
+          )
+        }
+      }
+
+      console.log('Share API status:', response.status)
+      console.log('Share API response:', result)
+
+      setMessage(result.message || 'File shared successfully.')
+
+      setSharingFileId(null)
+      setRecipientEmail('')
+    } catch (error) {
+      setMessage(`Sharing failed: ${error.message}`)
+    } finally {
+      setSharing(false)
     }
   }
 
@@ -266,6 +381,60 @@ function Files({ theme = 'dark' }) {
         }
       `}</style>
 
+
+      {/* Shared With Me */}
+      <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+        <div className="mb-5 flex items-center justify-between gap-3">
+          <h2 className="text-lg font-bold text-white">
+            Shared With Me
+          </h2>
+
+          <button
+            onClick={loadSharedFiles}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm text-white"
+          >
+            Refresh
+          </button>
+        </div>
+
+        {sharedFiles.length === 0 ? (
+          <p className="text-sm text-slate-400">
+            No files have been shared with you yet.
+          </p>
+        ) : (
+          <div className="space-y-3">
+            {sharedFiles.map((file) => (
+              <div
+                key={file.id}
+                className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-700 bg-slate-800/40 p-4"
+              >
+                <div>
+                  <p className="font-medium text-white">
+                    {file.filename}
+                  </p>
+
+                  <p className="mt-1 text-xs text-slate-400">
+                    Shared by: {file.shared_by}
+                  </p>
+
+                  <span className="mt-2 inline-block text-xs text-blue-400">
+                    {file.classification}
+                  </span>
+                </div>
+
+                <button
+                  onClick={() => handleDownload(file.id, file.filename)}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm text-white"
+                >
+                  Download
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+
       {/* Upload section */}
       <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 sm:p-7">
         <div className="flex items-center gap-3">
@@ -291,11 +460,10 @@ function Files({ theme = 'dark' }) {
             onDragLeave={() => setDragging(false)}
             onDrop={handleDrop}
             onClick={() => fileInputRef.current?.click()}
-            className={`cursor-pointer rounded-xl border-2 border-dashed p-8 text-center transition sm:p-10 ${
-              dragging
-                ? 'border-blue-400 bg-blue-500/10'
-                : 'border-slate-700 bg-slate-950/50 hover:border-blue-500/60 hover:bg-blue-500/5'
-            }`}
+            className={`cursor-pointer rounded-xl border-2 border-dashed p-8 text-center transition sm:p-10 ${dragging
+              ? 'border-blue-400 bg-blue-500/10'
+              : 'border-slate-700 bg-slate-950/50 hover:border-blue-500/60 hover:bg-blue-500/5'
+              }`}
           >
             <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-500/10 text-3xl text-blue-400">
               ↑
@@ -403,6 +571,95 @@ function Files({ theme = 'dark' }) {
         )}
       </div>
 
+
+      {sharingFileId !== null && (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+          <h3 className="mb-4 text-lg font-bold text-white">
+            Share File
+          </h3>
+
+          <form onSubmit={handleShare} className="space-y-4">
+            <div>
+              <label className="mb-2 block text-sm text-slate-300">
+                Registered User Email
+              </label>
+
+              <input
+                type="email"
+                required
+                value={recipientEmail}
+                onChange={(e) => setRecipientEmail(e.target.value)}
+                placeholder="Enter recipient email"
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 text-white"
+              />
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                type="submit"
+                disabled={sharing}
+                className="rounded-lg bg-blue-600 px-5 py-2 text-white disabled:opacity-50"
+              >
+                {sharing ? 'Sharing...' : 'Share File'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setSharingFileId(null)}
+                className="rounded-lg border border-slate-700 px-5 py-2 text-slate-300"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Revoke Access Form */}
+      {revokingFileId !== null && (
+        <div className="rounded-2xl border border-red-900/40 bg-slate-900 p-6">
+          <h3 className="mb-4 text-lg font-bold text-white">
+            Revoke File Access
+          </h3>
+
+          <form onSubmit={handleRevoke} className="space-y-4">
+            <div>
+              <label className="mb-2 block text-sm text-slate-300">
+                Recipient Email
+              </label>
+              <input
+                type="email"
+                required
+                value={revokeEmail}
+                onChange={(event) => setRevokeEmail(event.target.value)}
+                placeholder="priya@test.com"
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 text-white"
+              />
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                type="submit"
+                disabled={revoking}
+                className="rounded-lg bg-red-600 px-5 py-2 text-white disabled:opacity-50"
+              >
+                {revoking ? 'Revoking...' : 'Revoke Access'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setRevokingFileId(null)
+                  setRevokeEmail('')
+                }}
+                className="rounded-lg border border-slate-700 px-5 py-2 text-slate-300"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {/* File list */}
       <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 p-5 sm:p-6">
@@ -487,11 +744,10 @@ function Files({ theme = 'dark' }) {
                         ) : (
                           <div>
                             <span
-                              className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${
-                                policy.compliant
-                                  ? 'bg-emerald-500/10 text-emerald-400'
-                                  : 'bg-red-500/10 text-red-400'
-                              }`}
+                              className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${policy.compliant
+                                ? 'bg-emerald-500/10 text-emerald-400'
+                                : 'bg-red-500/10 text-red-400'
+                                }`}
                             >
                               {policy.compliant
                                 ? 'Compliant'
@@ -523,7 +779,30 @@ function Files({ theme = 'dark' }) {
                           >
                             Download
                           </button>
-
+                          {file.classification !== 'RESTRICTED' && (
+                            <button
+                              onClick={() => {
+                                setSharingFileId(file.id)
+                                setRecipientEmail('')
+                                setRevokingFileId(null)
+                              }}
+                              className="rounded-md bg-purple-500/10 px-3 py-2 text-xs font-medium text-purple-400 hover:bg-purple-500/20"
+                            >
+                              Share
+                            </button>
+                          )}
+                          {file.classification !== 'RESTRICTED' && (
+  <button
+    onClick={() => {
+      setRevokingFileId(file.id)
+      setRevokeEmail('')
+      setSharingFileId(null)
+    }}
+    className="rounded-md bg-red-500/10 px-3 py-2 text-xs font-medium text-red-400 hover:bg-red-500/20"
+  >
+    Revoke Access
+  </button>
+)}
                           <button
                             onClick={() => handlePolicyCheck(file.id)}
                             className="rounded-md bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-400 transition hover:bg-emerald-500/20"

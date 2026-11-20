@@ -1,7 +1,10 @@
 from app.encryption import encrypt_data, decrypt_data
 from app.audit import log_event
 
-from app.azure_storage import get_container_client
+from app.azure_storage import (
+    get_container_client,
+    get_replica_container_client,
+)
 import uuid
 
 from pydantic import BaseModel, EmailStr
@@ -97,20 +100,58 @@ def upload_file(
     if policy["encryption_required"]:
         file_data = encrypt_data(file_data)
 
-    # 7. Upload to Azure Blob Storage
+    
+    # 7. Upload to primary Azure Storage
     container_client = get_container_client()
     blob_client = container_client.get_blob_client(blob_name)
 
     try:
         blob_client.upload_blob(file_data, overwrite=False)
 
-    except Exception as e:
-        logger.exception("Azure Blob Storage upload failed")
-
+    except Exception:
+        logger.exception("Primary Azure upload failed")
         raise HTTPException(
             status_code=502,
-            detail="Failed to upload file to Azure Blob Storage"
+            detail="Primary storage upload failed"
         )
+
+    # 8. Replicate encrypted data when policy requires it
+    if policy["replication_required"]:
+        try:
+            replica_container = get_replica_container_client()
+            replica_blob = replica_container.get_blob_client(blob_name)
+
+            replica_blob.upload_blob(
+                file_data,
+                overwrite=False
+            )
+
+            logger.info(
+                "File replicated successfully: %s",
+                blob_name
+            )
+
+        except Exception:
+            logger.exception("Replica upload failed")
+
+            # Avoid leaving a primary-only copy when
+            # replication is required by policy.
+            try:
+                blob_client.delete_blob(
+                    delete_snapshots="include"
+                )
+            except Exception:
+                logger.exception(
+                    "Primary cleanup failed after replica error"
+                )
+
+            raise HTTPException(
+                status_code=502,
+                detail="Replication failed. Upload not completed."
+            )
+
+    file_size = original_size
+
 
     file_size = original_size
 
@@ -428,8 +469,6 @@ class ShareFileRequest(BaseModel):
     email: EmailStr
 
 @router.post("/{file_id}/share")
-
-@router.post("/{file_id}/share")
 def share_file(
     file_id: int,
     request: ShareFileRequest,
@@ -513,6 +552,61 @@ def share_file(
         "shared_with": recipient.email,
         "permission": "READ"
     }
+
+
+@router.delete("/{file_id}/share")
+def revoke_file_access_by_email(
+    file_id: int,
+    request: ShareFileRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    file = db.query(File).filter(File.id == file_id).first()
+
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if file.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the file owner can revoke access"
+        )
+
+    recipient = db.query(User).filter(
+        User.email == str(request.email)
+    ).first()
+
+    if not recipient:
+        raise HTTPException(
+            status_code=404,
+            detail="Recipient not found"
+        )
+
+    permission = db.query(FilePermission).filter(
+        FilePermission.file_id == file_id,
+        FilePermission.user_id == recipient.id
+    ).first()
+
+    if not permission:
+        raise HTTPException(
+            status_code=404,
+            detail="No sharing permission found"
+        )
+
+    db.delete(permission)
+    db.commit()
+
+    log_event(
+        db=db,
+        action="FILE_ACCESS_REVOKED",
+        resource_type="FILE",
+        status="SUCCESS",
+        user_id=current_user.id,
+        resource_id=file_id,
+        details=f"Access revoked for user ID {recipient.id}"
+    )
+
+    return {"message": "File access revoked successfully"}
 
 
 @router.delete("/{file_id}/share/{user_id}")
